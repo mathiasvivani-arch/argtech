@@ -92,6 +92,11 @@ REFRESCO_MAX = 10
 USAR_URL_DIRECTA = False  # probado: la página de asientos no tiene el botón sin buscar antes
 
 # Opcional: avisos al celular por Telegram. Dejalo vacío si no querés.
+# Cómo conseguirlos (una sola vez):
+#   1) En Telegram hablale a @BotFather, mandá /newbot, elegí nombre y usuario. Te da un TOKEN.
+#   2) Pegá el token acá abajo, y en Telegram abrí tu bot nuevo y mandale cualquier mensaje ("hola").
+#   3) En la terminal: python bot_boca.py telegram  -> te dice tu CHAT_ID y manda una prueba.
+#   4) Pegá el CHAT_ID acá abajo. Listo.
 TELEGRAM_TOKEN = ""
 TELEGRAM_CHAT_ID = ""
 
@@ -626,6 +631,33 @@ DESCARTADOS_VISTOS = set()  # uso interno: para avisar una sola vez por sector
 URL_MAPA = [None]  # uso interno: la pantalla del mapa (donde apretaste ENTER)
 
 
+ULTIMA_RESERVA = {}  # datos de la última reserva hecha (sector, asiento), para el aviso
+
+
+def telegram(metodo, **datos):
+    """Llama a la API de Telegram. Devuelve el JSON de respuesta o None si falló."""
+    import json
+    import urllib.parse
+    import urllib.request
+
+    try:
+        cuerpo = urllib.parse.urlencode(datos).encode() if datos else None
+        with urllib.request.urlopen(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{metodo}", cuerpo, timeout=10
+        ) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"  (Telegram {metodo}: {str(e)[:80]})")
+        return None
+
+
+def mandar_telegram(texto):
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+        return False
+    r = telegram("sendMessage", chat_id=TELEGRAM_CHAT_ID, text=texto, disable_web_page_preview="true")
+    return bool(r and r.get("ok"))
+
+
 def avisar(mensaje):
     print(f"\n*** {mensaje} ***\n")
     try:
@@ -635,19 +667,51 @@ def avisar(mensaje):
     except Exception:
         print("\a")
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            import urllib.parse
-            import urllib.request
-            datos = urllib.parse.urlencode(
-                {"chat_id": TELEGRAM_CHAT_ID, "text": mensaje}
-            ).encode()
-            urllib.request.urlopen(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                datos,
-                timeout=10,
+        texto = mensaje
+        if ULTIMA_RESERVA:
+            texto = (
+                "🟢🚨 ¡PLATEA EN TU CARRITO, LISTA PARA PAGAR!\n\n"
+                f"🏟 Sector: {ULTIMA_RESERVA.get('sector', '?')}\n"
+                f"💺 Asiento: {ULTIMA_RESERVA.get('asiento', '?')}\n\n"
+                f"💳 Link para pagar:\n{URL_MAPA[0] or URL}\n"
+                "👉 Abrí el link, andá al carrito, tocá CONTINUAR y pagá.\n"
+                "⏳ El carrito tiene tiempo límite: hacelo ya.\n\n"
+                "El bot dejó la pestaña quieta y no busca más hasta que apretes ENTER en la PC."
             )
-        except Exception as e:
-            print("No pude mandar el aviso por Telegram:", e)
+        if not mandar_telegram(texto):
+            print("  No pude mandar el aviso por Telegram.")
+
+
+def configurar_telegram():
+    """Modo 'telegram': averigua tu chat ID y manda un mensaje de prueba."""
+    if not TELEGRAM_TOKEN:
+        print("Primero pegá el TELEGRAM_TOKEN arriba del archivo (te lo da @BotFather con /newbot).")
+        return
+    yo = telegram("getMe")
+    if not (yo and yo.get("ok")):
+        print("El token no funciona. Revisá que lo hayas copiado entero, sin espacios.")
+        return
+    usuario = yo["result"].get("username")
+    print(f"Bot OK: @{usuario}")
+    chat_id = TELEGRAM_CHAT_ID
+    if not chat_id:
+        r = telegram("getUpdates")
+        ids = []
+        for u in (r or {}).get("result", []):
+            m = u.get("message") or u.get("edited_message") or {}
+            c = (m.get("chat") or {}).get("id")
+            if c and c not in ids:
+                ids.append(c)
+        if not ids:
+            print(f"No veo mensajes todavía. Abrí Telegram, buscá @{usuario}, mandale 'hola' y volvé a correr esto.")
+            return
+        chat_id = str(ids[-1])
+        print(f"Tu CHAT_ID es: {chat_id}   -> pegalo en TELEGRAM_CHAT_ID arriba del archivo.")
+    r = telegram("sendMessage", chat_id=chat_id, text="✅ Prueba del bot de Boca: los avisos van a llegar acá.")
+    if r and r.get("ok"):
+        print("Te mandé un mensaje de prueba. Si te llegó, ya está todo listo.")
+    else:
+        print("No pude mandar el mensaje de prueba. Revisá el CHAT_ID.")
 
 
 def buscar_boton(page, texto):
@@ -782,6 +846,7 @@ def _intentar_reservar(page):
         if i >= len(info["items"]):
             return False
         print(f"  Sector en verde: {info['items'][i]}")
+        ULTIMA_RESERVA.update({"sector": info["items"][i], "asiento": "(ver carrito)"})
         loc = page.locator(f'[data-bot-libre="{i}"]')
 
         # Ruta rápida: todo el recorrido adentro de la página, sin pausas
@@ -1134,6 +1199,7 @@ def revisar_fantasma(page):
         return False
     if r.get("ok"):
         print(f"  ¡Fantasma {nid} ({FANTASMAS[nid]['sector']}) se liberó y lo reservé!: {r}")
+        ULTIMA_RESERVA.update({"sector": FANTASMAS[nid]["sector"], "asiento": nid})
         try:
             page.goto(URL_MAPA[0], wait_until="commit")
         except Exception:
@@ -1191,6 +1257,7 @@ def reserva_api(page, nids):
         print(f"  Reserva directa (sector {nid}): {r}")
         anotar_fantasmas(r, SECTOR_DE.get(nid, nid))
         if r.get("ok"):
+            ULTIMA_RESERVA.update({"sector": SECTOR_DE.get(nid, nid), "asiento": r.get("asiento")})
             try:  # mostrar el carrito en pantalla para que pagues
                 page.goto(URL_MAPA[0], wait_until="commit")
             except Exception:
@@ -1477,6 +1544,10 @@ def main():
     modo_diagnostico = len(sys.argv) > 1 and sys.argv[1].lower().startswith("diag")
     modo_red = len(sys.argv) > 1 and sys.argv[1].lower().startswith("red")
     modo_grabar = len(sys.argv) > 1 and sys.argv[1].lower().startswith("grab")
+
+    if len(sys.argv) > 1 and sys.argv[1].lower().startswith("tele"):
+        configurar_telegram()  # no abre el navegador
+        return
 
     with sync_playwright() as p:
         opciones = {"viewport": {"width": 430, "height": 900}} if MODO_MOVIL else {}
