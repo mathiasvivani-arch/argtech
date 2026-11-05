@@ -407,9 +407,28 @@ async (cfg) => {
     } catch (e) {
       intentos.push({ error: String(e).slice(0, 60) });
     }
-    const nuevos = lista.filter((n) => !probados.has(n)).slice(0, cfg.maxAsientos);
+    // Asientos "fantasma": la lista del sector los muestra libres pero ya no lo están.
+    // Se recuerdan un rato para no gastar pedidos en ellos y probar enseguida los nuevos.
+    window.__fantasmas = window.__fantasmas || {};
+    const ahora = Date.now();
+    for (const k of Object.keys(window.__fantasmas)) {
+      if (ahora - window.__fantasmas[k] > cfg.olvidarFantasmaMs) delete window.__fantasmas[k];
+    }
+    const nuevos = lista.filter((n) => !probados.has(n) && !window.__fantasmas[n]).slice(0, cfg.maxAsientos);
+    if (!nuevos.length && lista.length) intentos.push({ fantasmas: lista.slice(0, 5) });
     for (const nid of nuevos) {
       probados.add(nid);
+      // Mismo chequeo que hace la página antes de ofrecer "Agregar platea".
+      try {
+        const v = await pedir(cfg.base + '/event/seat/location/' + nid + '/availability',
+                              { method: 'GET', headers: cfg.headers });
+        const disp = v.cuerpo && v.cuerpo.ubicacion && v.cuerpo.ubicacion.disponible;
+        if (v.ok && disp === false) {
+          window.__fantasmas[nid] = Date.now();
+          intentos.push({ asiento: nid, fantasma: true });
+          continue;
+        }
+      } catch (e) {}
       try {
         const r = await pedir(cfg.base + '/event/seat/reserve/' + nid, {
           method: 'POST',
@@ -421,6 +440,7 @@ async (cfg) => {
         intentos.push({ asiento: nid, estado: r.estado, cod: cod || null, msg: msg ? String(msg).slice(0, 120) : null,
                         cuerpo: r.ok ? undefined : JSON.stringify(r.cuerpo || null).slice(0, 200) });
         if (r.estado === 403 || r.estado === 429) return { ok: false, paso: 'bloqueado', estado: r.estado, intentos: intentos };
+        if (r.estado >= 400) window.__fantasmas[nid] = Date.now();
         if (r.ok) {
           let carrito = null;
           try {
@@ -1038,6 +1058,7 @@ def reserva_api(page, nids):
                     "rondas": 3,
                     "pausaMs": 120,
                     "maxAsientos": 8,
+                    "olvidarFantasmaMs": 60000,
                 },
             )
         except Exception as e:
@@ -1058,10 +1079,11 @@ def reserva_api(page, nids):
             # Solo cuenta como "se lo llevaron" si no quedaba ningún asiento en el sector.
             # Un 500 (error del servidor) NO es "tomada": el asiento sigue figurando libre y
             # el pedido directo no le gusta al servidor. En ese caso hay que ir por los clics.
-            if not ints:
+            if not ints or all(i.get("fantasma") or "fantasmas" in i for i in ints):
+                # Lista vacía, o solo asientos fantasma (figuran libres pero no lo están)
                 tomada = True
             elif any(i.get("estado") == 500 for i in ints):
-                print("  El servidor rechazó la reserva directa (500): voy por el método de clics.")
+                print("  El servidor rechazó la reserva directa (500) de un asiento que decía libre: voy por el método de clics.")
                 return False
             elif all(("estado" in i) for i in ints):
                 tomada = True
