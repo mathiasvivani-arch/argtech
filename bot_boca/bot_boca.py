@@ -1032,10 +1032,19 @@ def capturar_api(page):
             pedidos.append(req)
 
     page.on("request", al_pedir)
-    page.reload(wait_until="commit")
-    esperar_mapa(page, 12000)
-    page.wait_for_timeout(500)
-    page.remove_listener("request", al_pedir)
+    try:
+        # Ir al mapa (no solo recargar): si la pestaña quedó en la pantalla de un sector,
+        # recargar ahí no pide la disponibilidad y no habría nada que copiar.
+        if URL_MAPA[0] and page.url.split("?")[0].rstrip("/") != URL_MAPA[0].split("?")[0].rstrip("/"):
+            page.goto(URL_MAPA[0], wait_until="commit")
+        else:
+            page.reload(wait_until="commit")
+        esperar_mapa(page, 12000)
+        page.wait_for_timeout(500)
+    except Exception as e:
+        print(f"  (no pude recargar el mapa para renovar la API: {str(e)[:70]})")
+    finally:
+        page.remove_listener("request", al_pedir)
     if not pedidos:
         return False
     req = pedidos[-1]
@@ -1091,13 +1100,25 @@ def crear_pagina_trabajo(page):
     print("  OJO: sin pestaña de trabajo, cada F5 del mapa corta la vigilancia un instante.")
 
 
+ULTIMO_FALLO_API = [""]  # por qué falló la última consulta (para mostrarlo una sola vez)
+
+
 def consultar_api(page):
-    """Devuelve {'todos': [...], 'libres': [...]} o None si la consulta falló."""
-    try:
-        r = pagina_api(page).evaluate(JS_API, {"url": API["url"], "headers": API["headers"]})
-    except Exception:
-        return None
-    return r if r.get("ok") else None
+    """Devuelve {'todos': [...], 'libres': [...]} o None si la consulta falló.
+
+    Prueba desde la pestaña de trabajo y, si esa no puede, desde la principal."""
+    motivo = ""
+    for pestana in dict.fromkeys([pagina_api(page), page]):
+        try:
+            r = pestana.evaluate(JS_API, {"url": API["url"], "headers": API["headers"]})
+        except Exception as e:
+            motivo = str(e)[:70]
+            continue
+        if r.get("ok"):
+            return r
+        motivo = f"estado {r.get('estado')}" if r.get("estado") else str(r.get("error", ""))[:70]
+    ULTIMO_FALLO_API[0] = motivo
+    return None
 
 
 def _en(lista, codigo):
@@ -1368,19 +1389,22 @@ def bucle_api(page):
         r = consultar_api(page)
         if r is None:
             fallos += 1
+            if fallos == 3:
+                print(f"  La API no responde ({ULTIMO_FALLO_API[0]}); renuevo la conexión.")
             if fallos >= 3:
-                if not renovado:
-                    print("  La API no responde; renuevo la conexión.")
-                    renovado = True
-                    capturar_api(page)
-                    fallos = 0
-                else:
-                    print("  La API dejó de responder; vuelvo al método de recarga.")
-                    return False
-            # Un fallo suelto suele ser el F5 cortando la consulta: reintentar enseguida.
-            # (No pega al servidor: la consulta ni salió.)
-            time.sleep(0.3)
+                # Nunca volver al método lento: reconectar hasta que la API vuelva.
+                # (Cada renovación es una recarga del mapa, nada más.)
+                renovado = capturar_api(page)
+                if not renovado and fallos % 5 == 0:
+                    print("  Sigo sin poder leer la API. Mirá el navegador: puede estar pidiendo login, cola o captcha.")
+                time.sleep(3)
+            else:
+                # Un fallo suelto suele ser el F5 cortando la consulta: reintentar enseguida.
+                # (No pega al servidor: la consulta ni salió.)
+                time.sleep(0.3)
             continue
+        if fallos >= 3:
+            print("  La API volvió. Sigo vigilando.")
         fallos = 0
         renovado = False
         quiero = [c for c in r["libres"] if quiero_sector(c)]
