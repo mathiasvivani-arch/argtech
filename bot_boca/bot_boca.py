@@ -1042,6 +1042,11 @@ def mostrar_mapa_actualizado(page, espera=3):
     return False
 
 
+ENFRIADO = {}  # sector -> hasta cuándo no volver a consultarlo (solo tenía fantasmas)
+ENFRIAR_SEG = 4.0  # un sector con solo fantasmas se deja descansar este tiempo
+PAUSA_BLOQUEO_SEG = 25.0  # si el servidor contesta 403/429, se para este tiempo
+
+
 def reserva_api(page, nids):
     """Reserva hablando directo con el servidor (mismos pedidos que hace la página)."""
     if not (USAR_RESERVA_API and nids and API["url"]):
@@ -1051,6 +1056,10 @@ def reserva_api(page, nids):
         return False
     base, evento = m.group(1), m.group(2)
     tomada = False
+    ahora = time.time()
+    nids = [n for n in nids if ENFRIADO.get(n, 0) <= ahora]
+    if not nids:
+        return "tomada"  # todos en descanso: no se gasta ni un pedido
     for nid in nids:
         try:
             r = pagina_api(page).evaluate(
@@ -1060,7 +1069,7 @@ def reserva_api(page, nids):
                     "seccion": nid,
                     "headers": API["headers"],
                     "carrito": f"{base}/member/shoppingCart/{evento}",
-                    "rondas": 3,
+                    "rondas": 1,  # una sola pasada: la vigilancia ya vuelve a consultar enseguida
                     "pausaMs": 120,
                     "maxAsientos": 8,
                     "olvidarFantasmaMs": 60000,
@@ -1077,15 +1086,17 @@ def reserva_api(page, nids):
                 pass
             return True
         if r.get("paso") == "bloqueado":
-            print("  El servidor te frenó (403/429): no insisto, sigo con el método normal.")
-            return False
+            print(f"  El servidor te frenó ({r.get('estado')}): paro {PAUSA_BLOQUEO_SEG:.0f} s para que se destrabe.")
+            return "bloqueado"
         if r.get("paso") == "agotada":
             ints = r.get("intentos") or []
             # Solo cuenta como "se lo llevaron" si no quedaba ningún asiento en el sector.
             # Un 500 (error del servidor) NO es "tomada": el asiento sigue figurando libre y
             # el pedido directo no le gusta al servidor. En ese caso hay que ir por los clics.
             if not ints or all(i.get("fantasma") or "fantasmas" in i for i in ints):
-                # Lista vacía, o solo asientos fantasma (figuran libres pero no lo están)
+                # Lista vacía, o solo asientos fantasma (figuran libres pero no lo están):
+                # dejar descansar el sector para no gastar pedidos en lo mismo.
+                ENFRIADO[nid] = time.time() + ENFRIAR_SEG
                 tomada = True
             elif any(i.get("estado") == 500 for i in ints):
                 print("  El servidor rechazó la reserva directa (500) de un asiento que decía libre: voy por el método de clics.")
@@ -1207,9 +1218,13 @@ def bucle_api(page):
             avisar("¡RESERVA HECHA! Andá al navegador y pagá YA (el carrito tiene tiempo límite).")
             input("Cuando termines, apretá ENTER para cerrar...")
             return True
+        if res_api == "bloqueado":
+            # El servidor nos frenó: insistir (por API o por clics) solo empeora el bloqueo.
+            time.sleep(PAUSA_BLOQUEO_SEG)
+            continue
         if res_api == "tomada" and SOLO_API_SI_TOMADA:
-            # Se lo llevó otro: seguimos vigilando sin abrir pantallas (que cargan lento)
-            time.sleep(0.6)
+            # Se lo llevó otro o era fantasma: seguimos vigilando sin abrir pantallas
+            time.sleep(random.uniform(INTERVALO_API_MIN, INTERVALO_API_MAX))
             continue
         if reserva_directa(page, nids):
             avisar("¡RESERVA HECHA! Andá al navegador y terminá la compra YA.")
