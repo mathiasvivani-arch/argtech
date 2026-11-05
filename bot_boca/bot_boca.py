@@ -419,17 +419,8 @@ async (cfg) => {
     if (!nuevos.length && lista.length) intentos.push({ fantasmas: lista.slice(0, 5) });
     for (const nid of nuevos) {
       probados.add(nid);
-      // Mismo chequeo que hace la página antes de ofrecer "Agregar platea".
-      try {
-        const v = await pedir(cfg.base + '/event/seat/location/' + nid + '/availability',
-                              { method: 'GET', headers: cfg.headers });
-        const disp = v.cuerpo && v.cuerpo.ubicacion && v.cuerpo.ubicacion.disponible;
-        if (v.ok && disp === false) {
-          window.__fantasmas[nid] = Date.now();
-          intentos.push({ asiento: nid, fantasma: true });
-          continue;
-        }
-      } catch (e) {}
+      // Asiento nuevo: POST directo, sin chequeo previo (es el mismo pedido que hace la
+      // página al apretar "Agregar platea"; si ya no está, contesta 500 y lo anotamos).
       try {
         const r = await pedir(cfg.base + '/event/seat/reserve/' + nid, {
           method: 'POST',
@@ -466,6 +457,55 @@ async (cfg) => {
     if (ronda < cfg.rondas - 1) await dormir(cfg.pausaMs);
   }
   return { ok: false, paso: 'agotada', intentos: intentos };
+}
+"""
+
+# Revisa UN asiento "fantasma" (está en el carrito de otro). Si se liberó, lo reserva al toque.
+#   1) GET  /event/seat/location/<asiento>/availability -> disponible: true/false
+#   2) POST /event/seat/reserve/<asiento>   (solo si está disponible)
+#   3) GET  /member/shoppingCart/<partido>  -> comprueba que quedó en el carrito
+JS_REVISAR_FANTASMA = r"""
+async (cfg) => {
+  const pedir = async (url, opciones) => {
+    const orden = window.__credApi === 'omit' ? ['omit', 'include'] : ['include', 'omit'];
+    let fallo = null;
+    for (const cred of orden) {
+      try {
+        const r = await fetch(url, Object.assign({ credentials: cred, cache: 'no-store' }, opciones));
+        window.__credApi = cred;
+        let cuerpo = null;
+        try { cuerpo = await r.json(); } catch (e) {}
+        return { estado: r.status, ok: r.ok, cuerpo: cuerpo };
+      } catch (e) { fallo = e; }
+    }
+    throw fallo;
+  };
+  try {
+    const v = await pedir(cfg.base + '/event/seat/location/' + cfg.nid + '/availability',
+                          { method: 'GET', headers: cfg.headers });
+    if (v.estado === 403 || v.estado === 429) return { ok: false, paso: 'bloqueado', estado: v.estado };
+    const disp = v.cuerpo && v.cuerpo.ubicacion && v.cuerpo.ubicacion.disponible;
+    if (!v.ok || disp !== true) return { ok: false, paso: 'sigue_tomado', estado: v.estado };
+    const r = await pedir(cfg.base + '/event/seat/reserve/' + cfg.nid, {
+      method: 'POST',
+      headers: Object.assign({}, cfg.headers, { 'content-type': 'application/json' }),
+      body: JSON.stringify({ eventoUbicacionNid: cfg.nid }),
+    });
+    if (r.estado === 403 || r.estado === 429) return { ok: false, paso: 'bloqueado', estado: r.estado };
+    if (!r.ok) {
+      const msg = r.cuerpo && (r.cuerpo.descripcion || r.cuerpo.codigo);
+      return { ok: false, paso: 'perdido', estado: r.estado, msg: msg ? String(msg).slice(0, 80) : null };
+    }
+    let carrito = null;
+    try {
+      const c = await pedir(cfg.carrito, { method: 'GET', headers: cfg.headers });
+      carrito = !!(c.cuerpo && c.cuerpo.items && c.cuerpo.items.length);
+    } catch (e) {}
+    if (carrito === false) return { ok: false, paso: 'ok_pero_carrito_vacio', cuerpo: JSON.stringify(r.cuerpo || null).slice(0, 200) };
+    return { ok: true, paso: 'reservado', asiento: cfg.nid, enCarrito: carrito };
+  } catch (e) {
+    return { ok: false, paso: 'error', error: String(e).slice(0, 60) };
+  }
 }
 """
 
@@ -1042,9 +1082,71 @@ def mostrar_mapa_actualizado(page, espera=3):
     return False
 
 
+SECTOR_DE = {}  # nid del sector -> código (SMV, SBI...), para los mensajes
 ENFRIADO = {}  # sector -> hasta cuándo no volver a consultarlo (solo tenía fantasmas)
 ENFRIAR_SEG = 4.0  # un sector con solo fantasmas se deja descansar este tiempo
 PAUSA_BLOQUEO_SEG = 25.0  # si el servidor contesta 403/429, se para este tiempo
+
+# Asientos "fantasma": figuran en la lista del sector pero están en el carrito de otro.
+# Si esa persona no paga a tiempo, el asiento se libera: por eso los vigilamos un rato.
+FANTASMAS = {}  # asiento -> {"sector": código, "visto": hora en que se lo vio}
+FANTASMA_OLVIDAR_SEG = 20 * 60  # cuánto tiempo vigilar un fantasma (el carrito vence antes)
+FANTASMA_CADA = 2  # revisa un fantasma cada N consultas (1 pedido chico, en rueda)
+_rueda_fantasma = [0]
+
+
+def anotar_fantasmas(resultado, sector):
+    """Guarda los asientos que el servidor rechazó (están en el carrito de otro)."""
+    ahora = time.time()
+    for i in resultado.get("intentos") or []:
+        nids = []
+        if i.get("asiento") and (i.get("fantasma") or (i.get("estado") or 0) >= 400):
+            nids.append(i["asiento"])
+        nids.extend(i.get("fantasmas") or [])
+        for n in nids:
+            if n not in FANTASMAS:
+                print(f"  Asiento {n} ({sector}) está en el carrito de otro: lo vigilo por si se libera.")
+            FANTASMAS[n] = {"sector": sector, "visto": ahora}
+
+
+def revisar_fantasma(page):
+    """Revisa el siguiente fantasma de la rueda. True si lo reservó; 'bloqueado' si nos frenaron."""
+    ahora = time.time()
+    for n in [k for k, v in FANTASMAS.items() if ahora - v["visto"] > FANTASMA_OLVIDAR_SEG]:
+        del FANTASMAS[n]
+    if not FANTASMAS or not API["url"]:
+        return False
+    m = re.match(r"^(https?://[^/]+)/event/(\d+)/", API["url"])
+    if not m:
+        return False
+    base, evento = m.group(1), m.group(2)
+    nids = sorted(FANTASMAS)
+    nid = nids[_rueda_fantasma[0] % len(nids)]
+    _rueda_fantasma[0] += 1
+    try:
+        r = pagina_api(page).evaluate(
+            JS_REVISAR_FANTASMA,
+            {"base": base, "nid": nid, "headers": API["headers"],
+             "carrito": f"{base}/member/shoppingCart/{evento}"},
+        )
+    except Exception as e:
+        print(f"  (revisión de fantasma cortada: {str(e)[:70]})")
+        return False
+    if r.get("ok"):
+        print(f"  ¡Fantasma {nid} ({FANTASMAS[nid]['sector']}) se liberó y lo reservé!: {r}")
+        try:
+            page.goto(URL_MAPA[0], wait_until="commit")
+        except Exception:
+            pass
+        return True
+    if r.get("paso") == "bloqueado":
+        print(f"  El servidor te frenó ({r.get('estado')}) revisando fantasmas: paro {PAUSA_BLOQUEO_SEG:.0f} s.")
+        return "bloqueado"
+    if r.get("paso") in ("perdido", "ok_pero_carrito_vacio"):
+        print(f"  Fantasma {nid} se liberó pero no lo pude agarrar: {r}")
+    if r.get("paso") == "sigue_tomado" and r.get("estado") == 404:
+        del FANTASMAS[nid]  # ya no existe para el servidor
+    return False
 
 
 def reserva_api(page, nids):
@@ -1079,6 +1181,7 @@ def reserva_api(page, nids):
             print(f"  (reserva directa cortada: {str(e)[:70]})")
             continue
         print(f"  Reserva directa (sector {nid}): {r}")
+        anotar_fantasmas(r, SECTOR_DE.get(nid, nid))
         if r.get("ok"):
             try:  # mostrar el carrito en pantalla para que pagues
                 page.goto(URL_MAPA[0], wait_until="commit")
@@ -1208,11 +1311,24 @@ def bucle_api(page):
                 print(
                     f"Consulta {intento}: funcionando. "
                     f"Sectores con lugar ahora (en total): {r['libres'] or 'ninguno'}"
+                    + (f". Fantasmas vigilados: {len(FANTASMAS)}" if FANTASMAS else "")
                 )
+            if FANTASMAS and intento % FANTASMA_CADA == 0:
+                res_f = revisar_fantasma(page)
+                if res_f is True:
+                    avisar("¡RESERVA HECHA! Andá al navegador y pagá YA (el carrito tiene tiempo límite).")
+                    input("Cuando termines, apretá ENTER para cerrar...")
+                    return True
+                if res_f == "bloqueado":
+                    time.sleep(PAUSA_BLOQUEO_SEG)
+                    continue
             time.sleep(random.uniform(INTERVALO_API_MIN, INTERVALO_API_MAX))
             continue
         print(f"  ¡La API dice que hay lugar en: {quiero}!")
         nids = [r["nids"][c] for c in quiero if c in (r.get("nids") or {})]
+        for c in quiero:
+            if c in (r.get("nids") or {}):
+                SECTOR_DE[r["nids"][c]] = c
         res_api = reserva_api(page, nids)
         if res_api is True:
             avisar("¡RESERVA HECHA! Andá al navegador y pagá YA (el carrito tiene tiempo límite).")
