@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+perfil_*/
+pagina.html
+red.txt
+grabacion.txt
