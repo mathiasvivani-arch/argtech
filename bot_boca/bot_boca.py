@@ -1617,6 +1617,17 @@ def main():
             contexto.close()
             return
 
+        # No arrancar ciego: si el mapa no está cargado, esperar a que lo esté.
+        while True:
+            try:
+                formas = page.evaluate(JS_CONTAR_FORMAS)
+            except Exception:
+                formas = 0
+            if formas >= 50:
+                break
+            print(f"  No veo el mapa cargado (solo {formas} formas; tiene que haber ~200).")
+            input("  Esperá a que se dibujen los sectores (F5 si hace falta; login o cola si pide) y apretá ENTER... ")
+
         URL_MAPA[0] = page.url
         bloquear_pesados(contexto)
         grabar_pedidos(page)
