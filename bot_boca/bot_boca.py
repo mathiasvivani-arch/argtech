@@ -1162,23 +1162,31 @@ def reserva_api(page, nids):
     nids = [n for n in nids if ENFRIADO.get(n, 0) <= ahora]
     if not nids:
         return "tomada"  # todos en descanso: no se gasta ni un pedido
+    cfg_base = {
+        "base": base,
+        "headers": API["headers"],
+        "carrito": f"{base}/member/shoppingCart/{evento}",
+        "rondas": 1,  # una sola pasada: la vigilancia ya vuelve a consultar enseguida
+        "pausaMs": 120,
+        "maxAsientos": 8,
+        "olvidarFantasmaMs": 60000,
+    }
     for nid in nids:
-        try:
-            r = pagina_api(page).evaluate(
-                JS_RESERVA_API,
-                {
-                    "base": base,
-                    "seccion": nid,
-                    "headers": API["headers"],
-                    "carrito": f"{base}/member/shoppingCart/{evento}",
-                    "rondas": 1,  # una sola pasada: la vigilancia ya vuelve a consultar enseguida
-                    "pausaMs": 120,
-                    "maxAsientos": 8,
-                    "olvidarFantasmaMs": 60000,
-                },
-            )
-        except Exception as e:
-            print(f"  (reserva directa cortada: {str(e)[:70]})")
+        r = None
+        # Primero desde la pestaña de trabajo; si el pedido ni sale ("Failed to fetch"),
+        # reintenta enseguida desde la pestaña principal (misma sesión, otra pestaña).
+        for pestana in dict.fromkeys([pagina_api(page), page]):
+            try:
+                r = pestana.evaluate(JS_RESERVA_API, dict(cfg_base, seccion=nid))
+            except Exception as e:
+                print(f"  (reserva directa cortada: {str(e)[:70]})")
+                continue
+            ints = r.get("intentos") or []
+            solo_errores = ints and all("error" in i and "asiento" not in i for i in ints)
+            if not solo_errores:
+                break
+            print(f"  Reserva directa (sector {nid}) no pudo ni preguntar: {r}. Pruebo desde la otra pestaña.")
+        if r is None:
             continue
         print(f"  Reserva directa (sector {nid}): {r}")
         anotar_fantasmas(r, SECTOR_DE.get(nid, nid))
@@ -1271,6 +1279,17 @@ def reserva_directa(page, nids):
     return False
 
 
+def turno_fantasma(page, intento):
+    """Cada FANTASMA_CADA consultas revisa un fantasma. True si reservó; 'bloqueado' si nos frenaron."""
+    if not FANTASMAS or intento % FANTASMA_CADA != 0:
+        return False
+    res_f = revisar_fantasma(page)
+    if res_f is True:
+        avisar("¡RESERVA HECHA! Andá al navegador y pagá YA (el carrito tiene tiempo límite).")
+        input("Cuando termines, apretá ENTER para cerrar...")
+    return res_f
+
+
 def bucle_api(page):
     """Vigila por la API. Devuelve True si hizo la reserva, False si hay que usar la recarga."""
     print("Vigilando por la API (rápido). Para frenar: Ctrl+C.")
@@ -1313,22 +1332,24 @@ def bucle_api(page):
                     f"Sectores con lugar ahora (en total): {r['libres'] or 'ninguno'}"
                     + (f". Fantasmas vigilados: {len(FANTASMAS)}" if FANTASMAS else "")
                 )
-            if FANTASMAS and intento % FANTASMA_CADA == 0:
-                res_f = revisar_fantasma(page)
-                if res_f is True:
-                    avisar("¡RESERVA HECHA! Andá al navegador y pagá YA (el carrito tiene tiempo límite).")
-                    input("Cuando termines, apretá ENTER para cerrar...")
-                    return True
-                if res_f == "bloqueado":
-                    time.sleep(PAUSA_BLOQUEO_SEG)
-                    continue
-            time.sleep(random.uniform(INTERVALO_API_MIN, INTERVALO_API_MAX))
+            res_f = turno_fantasma(page, intento)
+            if res_f is True:
+                return True
+            time.sleep(PAUSA_BLOQUEO_SEG if res_f == "bloqueado" else random.uniform(INTERVALO_API_MIN, INTERVALO_API_MAX))
             continue
-        print(f"  ¡La API dice que hay lugar en: {quiero}!")
         nids = [r["nids"][c] for c in quiero if c in (r.get("nids") or {})]
         for c in quiero:
             if c in (r.get("nids") or {}):
                 SECTOR_DE[r["nids"][c]] = c
+        if all(ENFRIADO.get(n, 0) > time.time() for n in nids):
+            # Solo sectores en descanso (tenían fantasmas): no avisar de nuevo ni gastar pedidos,
+            # pero sí seguir revisando los fantasmas por si uno se liberó.
+            res_f = turno_fantasma(page, intento)
+            if res_f is True:
+                return True
+            time.sleep(PAUSA_BLOQUEO_SEG if res_f == "bloqueado" else random.uniform(INTERVALO_API_MIN, INTERVALO_API_MAX))
+            continue
+        print(f"  ¡La API dice que hay lugar en: {quiero}!")
         res_api = reserva_api(page, nids)
         if res_api is True:
             avisar("¡RESERVA HECHA! Andá al navegador y pagá YA (el carrito tiene tiempo límite).")
