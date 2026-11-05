@@ -50,8 +50,9 @@ SECTORES_NO = ["LID", "LIC", "LV", "LII", "LPD", "LPC", "LD", "LPI"]
 # Textos de los botones. Si en la página dicen otra cosa, cambialos acá.
 TEXTO_ACTUALIZAR = "Actualizar mapa"
 TEXTO_BUSCAR = "Buscar asiento disponible"
-# Botón final: el bot lo aprieta una sola vez y frena. El pago lo hacés vos.
-TEXTOS_FINALES = ["Agregar platea"]
+# Botón final: aprieta el PRIMERO de estos que aparezca, una sola vez, y frena. El pago lo hacés vos.
+# (El texto cambia según el partido/pantalla; por eso hay varios.)
+TEXTOS_FINALES = ["Agregar platea", "Reservar platea", "Comprar platea", "Reservar", "Comprar"]
 
 # Cada cuántos segundos actualiza el mapa (aleatorio entre estos valores).
 # No lo bajes demasiado: si pedís muy seguido te pueden bloquear.
@@ -294,18 +295,18 @@ async (cfg) => {
   const apretados = [];
   const textoPagina = () => (document.body.innerText || '').toLowerCase();
   let vacioAntes = false;
-  let limite = performance.now() + cfg.esperaFinalMs;
-  while (performance.now() < limite) {
+  const limite = performance.now() + cfg.esperaFinalMs;
+  while (performance.now() < limite && !apretados.length) {
     for (const t of cfg.finales) {
-      if (apretados.includes(t)) continue;
       const b = buscarBoton(t, true);
       if (b) {
         vacioAntes = /a[uú]n no agregaste/.test(textoPagina());
         b.click();
         apretados.push(t);
-        limite = apretados.length >= cfg.finales.length ? 0 : performance.now() + cfg.esperaExtraMs;
+        break;  // alternativas: con uno alcanza
       }
     }
+    if (/ya no est[aá] disponible/.test(textoPagina())) break;
     await dormir(5);
   }
   if (!apretados.length) return { ok: false, paso: 'finales', apretados: apretados };
@@ -651,23 +652,20 @@ def buscar_boton_estricto(page, texto):
 
 
 def pulsar_finales(page, espera_inicial=4.0, espera_extra=1.2):
-    """Aprieta los botones finales (Confirmar / Comprar) apenas aparecen, uno por vez."""
-    apretados = set()
+    """Aprieta el primer botón final que aparezca (Agregar / Reservar / Comprar platea)."""
     limite = time.time() + espera_inicial
     while time.time() < limite:
         for texto in TEXTOS_FINALES:
-            if texto in apretados:
-                continue
             boton = buscar_boton_estricto(page, texto)
             if boton is not None:
                 try:
                     boton.click(timeout=2000)
-                    apretados.add(texto)
-                    limite = time.time() + espera_extra
+                    print(f"  Apreté '{texto}'.")
+                    return True
                 except Exception:
                     pass
         page.wait_for_timeout(50)
-    return bool(apretados)
+    return False
 
 
 def completar_reserva(page):
@@ -768,9 +766,16 @@ def _intentar_reservar(page):
             if r.get("ok"):
                 return True
             if r.get("paso") == "finales":
-                # Ya apretó "Buscar asiento" pero no vio el botón final: no volvemos atrás
-                pulsar_finales(page, 3.0)
-                return True
+                # Ya apretó "Buscar asiento" pero no vio el botón final: le damos otra chance
+                if pulsar_finales(page, 3.0):
+                    return True
+                print("  No apareció ningún botón final (Agregar/Reservar/Comprar platea).")
+                try:
+                    print("  Botones que veo:", page.evaluate(JS_BOTONES))
+                except Exception:
+                    pass
+                volver_al_mapa(page)
+                return False
         except Exception as e:
             # La página cambió de pantalla en pleno clic: seguimos desde donde esté
             print(f"  (ruta rápida cortada: {str(e)[:70]})")
