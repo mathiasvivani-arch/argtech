@@ -416,8 +416,10 @@ async (cfg) => {
           headers: Object.assign({}, cfg.headers, { 'content-type': 'application/json' }),
           body: JSON.stringify({ eventoUbicacionNid: nid }),
         });
-        const cod = r.cuerpo && (r.cuerpo.codigo || r.cuerpo.descripcion);
-        intentos.push({ asiento: nid, estado: r.estado, cod: cod || null });
+        const cod = r.cuerpo && r.cuerpo.codigo;
+        const msg = r.cuerpo && (r.cuerpo.descripcion || r.cuerpo.mensaje || r.cuerpo.message || r.cuerpo.error);
+        intentos.push({ asiento: nid, estado: r.estado, cod: cod || null, msg: msg ? String(msg).slice(0, 120) : null,
+                        cuerpo: r.ok ? undefined : JSON.stringify(r.cuerpo || null).slice(0, 200) });
         if (r.estado === 403 || r.estado === 429) return { ok: false, paso: 'bloqueado', estado: r.estado, intentos: intentos };
         if (r.ok) {
           let carrito = null;
@@ -936,16 +938,19 @@ def crear_pagina_trabajo(page):
         if not m:
             return
         w = page.context.new_page()
-        try:
-            w.goto(m.group(1) + "/favicon.ico", wait_until="domcontentloaded", timeout=8000)
-            r = w.evaluate(JS_API, {"url": API["url"], "headers": API["headers"]})
-            if r.get("ok"):
-                TRABAJO[0] = w
-                page.bring_to_front()
-                print("  Pestaña de trabajo lista: vigila aparte, sin depender de la pantalla del mapa.")
-                return
-        except Exception:
-            pass
+        # /favicon.ico no sirve: es una imagen y bloquear_pesados la frena. robots.txt es texto.
+        for ruta in ("/robots.txt", "/"):
+            try:
+                w.goto(m.group(1) + ruta, wait_until="domcontentloaded", timeout=8000)
+                r = w.evaluate(JS_API, {"url": API["url"], "headers": API["headers"]})
+                if r.get("ok"):
+                    TRABAJO[0] = w
+                    page.bring_to_front()
+                    print("  Pestaña de trabajo lista: vigila aparte, sin depender de la pantalla del mapa.")
+                    return
+                print(f"  (pestaña de trabajo en {ruta}: la API contestó {r})")
+            except Exception as e:
+                print(f"  (pestaña de trabajo en {ruta}: {str(e)[:70]})")
         try:
             w.close()
         except Exception:
@@ -1050,8 +1055,15 @@ def reserva_api(page, nids):
             return False
         if r.get("paso") == "agotada":
             ints = r.get("intentos") or []
-            # El servidor contestó (asiento tomado o lista vacía): no hace falta abrir pantallas.
-            if not ints or any(("estado" in i) or i.get("lista_vacia") for i in ints):
+            # Solo cuenta como "se lo llevaron" si no quedaba ningún asiento en el sector.
+            # Un 500 (error del servidor) NO es "tomada": el asiento sigue figurando libre y
+            # el pedido directo no le gusta al servidor. En ese caso hay que ir por los clics.
+            if not ints:
+                tomada = True
+            elif any(i.get("estado") == 500 for i in ints):
+                print("  El servidor rechazó la reserva directa (500): voy por el método de clics.")
+                return False
+            elif all(("estado" in i) for i in ints):
                 tomada = True
     return "tomada" if tomada else False
 
