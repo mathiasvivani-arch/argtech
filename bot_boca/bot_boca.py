@@ -61,8 +61,8 @@ INTERVALO_MAX = 6
 
 # Modo rápido: el bot mira directo el dato de disponibilidad (sin recargar el mapa).
 # Cada cuántos segundos lo consulta. No lo bajes mucho, porque te pueden bloquear.
-INTERVALO_API_MIN = 0.5
-INTERVALO_API_MAX = 0.9
+INTERVALO_API_MIN = 0.8
+INTERVALO_API_MAX = 1.3
 
 # Opcional: ventana angosta (como un celular). Si la página muestra su propio botón
 # "Actualizar mapa", el bot lo usa y refresca más rápido. Probalo solo si querés.
@@ -87,8 +87,10 @@ USAR_RESERVA_API = True
 # cargan lentas y en gris): vuelve directo a vigilar. Poné False para el método de clics.
 SOLO_API_SI_TOMADA = True
 REFRESCAR_MAPA = True  # además de la API, recarga el mapa (F5) cada tanto
-REFRESCO_MIN = 6        # segundos entre recargas (aleatorio entre estos dos valores)
-REFRESCO_MAX = 10
+# El F5 solo mantiene viva la sesión (la detección la hace la API). Cada F5 del mapa dispara
+# decenas de pedidos al servidor, así que más seguido = más riesgo de bloqueo, no más rapidez.
+REFRESCO_MIN = 60       # segundos entre recargas (aleatorio entre estos dos valores)
+REFRESCO_MAX = 90
 USAR_URL_DIRECTA = False  # probado: la página de asientos no tiene el botón sin buscar antes
 
 # Opcional: avisos al celular por Telegram. Dejalo vacío si no querés.
@@ -1177,7 +1179,7 @@ PAUSA_BLOQUEO_SEG = 25.0  # si el servidor contesta 403/429, se para este tiempo
 # Si esa persona no paga a tiempo, el asiento se libera: por eso los vigilamos un rato.
 FANTASMAS = {}  # asiento -> {"sector": código, "visto": hora en que se lo vio}
 FANTASMA_OLVIDAR_SEG = 20 * 60  # cuánto tiempo vigilar un fantasma (el carrito vence antes)
-FANTASMA_CADA = 2  # revisa un fantasma cada N consultas (1 pedido chico, en rueda)
+FANTASMA_CADA = 3  # revisa un fantasma cada N consultas (1 pedido chico, en rueda)
 _rueda_fantasma = [0]
 
 
@@ -1392,12 +1394,20 @@ def bucle_api(page):
             if fallos == 3:
                 print(f"  La API no responde ({ULTIMO_FALLO_API[0]}); renuevo la conexión.")
             if fallos >= 3:
-                # Nunca volver al método lento: reconectar hasta que la API vuelva.
-                # (Cada renovación es una recarga del mapa, nada más.)
-                renovado = capturar_api(page)
-                if not renovado and fallos % 5 == 0:
-                    print("  Sigo sin poder leer la API. Mirá el navegador: puede estar pidiendo login, cola o captcha.")
-                time.sleep(3)
+                # Nunca volver al método lento, pero tampoco martillar: cada reconexión recarga
+                # el mapa (decenas de pedidos). Espera cada vez más: 15 s, 30 s, 60 s... hasta 3 min.
+                espera = min(15 * 2 ** max(0, (fallos - 3) // 2), 180)
+                bloqueo = any(c in ULTIMO_FALLO_API[0] for c in ("403", "429"))
+                if bloqueo:
+                    espera = max(espera, 120)
+                    print(f"  El servidor te está frenando ({ULTIMO_FALLO_API[0]}). Espero {espera} s sin pedir nada.")
+                else:
+                    print(f"  Espero {espera} s y vuelvo a probar.")
+                time.sleep(espera)
+                if not bloqueo:
+                    renovado = capturar_api(page)
+                    if not renovado and fallos % 5 == 0:
+                        print("  Sigo sin poder leer la API. Mirá el navegador: puede estar pidiendo login, cola o captcha.")
             else:
                 # Un fallo suelto suele ser el F5 cortando la consulta: reintentar enseguida.
                 # (No pega al servidor: la consulta ni salió.)
